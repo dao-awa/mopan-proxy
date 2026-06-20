@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -88,6 +89,7 @@ func (fs *MopanFS) Mkdir(ctx context.Context, name string, perm os.FileMode) err
 			time.Sleep(time.Duration(300+retry*200) * time.Millisecond)
 			resp, err := fs.client.ListFiles(parentID, "")
 			if err != nil {
+				log.Printf("WebDAV Mkdir metadata: list retry %d error: %v", retry, err)
 				continue
 			}
 			for _, item := range resp.Data.Items {
@@ -102,10 +104,13 @@ func (fs *MopanFS) Mkdir(ctx context.Context, name string, perm os.FileMode) err
 						CreatedAt:     time.Now(),
 						UpdatedAt:     time.Now(),
 					})
+					log.Printf("WebDAV Mkdir metadata: recorded '%s' -> '%s' (id=%s)", base, cloudName, item.FileId)
 					return nil
 				}
 			}
+			log.Printf("WebDAV Mkdir metadata: retry %d, cloudName='%s' not found in %d items", retry, cloudName, len(resp.Data.Items))
 		}
+		log.Printf("WebDAV Mkdir metadata: FAILED to record '%s' after 10 retries", base)
 	}
 
 	return nil

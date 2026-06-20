@@ -499,11 +499,8 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) startWebDAV() {
-	// 本地目录模式
-	localDir := "/mnt/yidong"
-	os.MkdirAll(localDir, 0755)
-	fs := webdav.Dir(localDir)
-	log.Printf("WebDAV 本地目录: %s", localDir)
+	fs := mopanWebdav.NewMopanFSWithEncryption(s.client, s.enc, s.store, s.rootID)
+	log.Printf("WebDAV 云盘模式 (root: %s)", s.rootID)
 	davHandler := &webdav.Handler{
 		Prefix:     "/dav",
 		FileSystem: fs,
