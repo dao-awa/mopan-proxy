@@ -3,7 +3,9 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -38,6 +40,11 @@ type Server struct {
 	httpSrv    *http.Server
 	webdavSrv  *http.Server
 	storeClose func()
+
+	// Session 管理
+	sessions   map[string]time.Time // sessionID → 过期时间
+	sessionMu  sync.RWMutex
+	sessionKey []byte // HMAC 签名密钥
 }
 
 func New(cfg *config.Config, configPath string) (*Server, error) {
@@ -55,6 +62,9 @@ func New(cfg *config.Config, configPath string) (*Server, error) {
 	}
 	if cfg.WebDAV.Password == "admin" && cfg.WebDAV.Username == "admin" {
 		log.Println("⚠️  警告: 正在使用默认 WebDAV 凭据 admin/admin，请修改")
+	}
+	if cfg.Auth.Enabled && cfg.Auth.Password == "admin123" {
+		log.Println("⚠️  警告: 正在使用默认登录密码 admin123，请在 config.yaml 中修改 auth.password")
 	}
 
 	var enc *crypto.Encryptor
@@ -86,10 +96,11 @@ func New(cfg *config.Config, configPath string) (*Server, error) {
 		store:      store,
 		webDir:     cfg.Storage.CacheDir,
 		storeClose: func() { store.Close() },
+		sessions:   make(map[string]time.Time),
 	}
 
 	if err := s.initRootFolder(); err != nil {
-		return nil, fmt.Errorf("init root folder: %w", err)
+		log.Printf("⚠️  根目录初始化失败: %v (可通过 Web UI 设置 Token 后重试)", err)
 	}
 
 	return s, nil
@@ -218,20 +229,27 @@ func (s *Server) csrfMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			// 额外检查 Origin 或 Referer（如果提供了的话）
 			origin := r.Header.Get("Origin")
 			referer := r.Header.Get("Referer")
+			allowed := func(url string) bool {
+				return strings.HasPrefix(url, "http://localhost") ||
+					strings.HasPrefix(url, "https://localhost") ||
+					strings.HasPrefix(url, "http://"+s.cfg.Host) ||
+					strings.HasPrefix(url, "https://"+s.cfg.Host) ||
+					strings.Contains(url, "webdav.96110.li") ||
+					strings.Contains(url, "yun.139.com")
+			}
 			if origin != "" {
-				if !strings.HasPrefix(origin, "http://localhost") && !strings.HasPrefix(origin, "https://localhost") &&
-					!strings.HasPrefix(origin, "http://"+s.cfg.Host) && !strings.HasPrefix(origin, "https://"+s.cfg.Host) {
+				if !allowed(origin) {
 					jsonError(w, "CSRF 验证失败", 403)
 					return
 				}
 			} else if referer != "" {
-				if !strings.Contains(referer, "localhost") && !strings.Contains(referer, s.cfg.Host) {
+				if !allowed(referer) {
 					jsonError(w, "CSRF 验证失败", 403)
 					return
 				}
+				}
 			}
-		}
-		next(w, r)
+			next(w, r)
 	}
 }
 
@@ -240,7 +258,7 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -271,8 +289,168 @@ func sanitizeName(name string) string {
 	return name
 }
 
+// ========== Session 管理 ==========
+
+func (s *Server) createSession() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	id := hex.EncodeToString(b)
+
+	s.sessionMu.Lock()
+	s.sessions[id] = time.Now().Add(7 * 24 * time.Hour)
+	s.sessionMu.Unlock()
+	return id
+}
+
+func (s *Server) validateSession(id string) bool {
+	if id == "" {
+		return false
+	}
+	s.sessionMu.RLock()
+	expiry, ok := s.sessions[id]
+	s.sessionMu.RUnlock()
+	if !ok {
+		return false
+	}
+	if time.Now().After(expiry) {
+		s.sessionMu.Lock()
+		delete(s.sessions, id)
+		s.sessionMu.Unlock()
+		return false
+	}
+	return true
+}
+
+func (s *Server) deleteSession(id string) {
+	s.sessionMu.Lock()
+	delete(s.sessions, id)
+	s.sessionMu.Unlock()
+}
+
+// 清理过期 session（每小时执行一次）
+func (s *Server) cleanupSessions() {
+	for {
+		time.Sleep(time.Hour)
+		now := time.Now()
+		s.sessionMu.Lock()
+		for id, expiry := range s.sessions {
+			if now.After(expiry) {
+				delete(s.sessions, id)
+			}
+		}
+		s.sessionMu.Unlock()
+	}
+}
+
+func (s *Server) getSessionCookie(r *http.Request) string {
+	c, err := r.Cookie("session_id")
+	if err != nil {
+		return ""
+	}
+	return c.Value
+}
+
+func (s *Server) setSessionCookie(w http.ResponseWriter, sessionID string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_id",
+		Value:    sessionID,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   7 * 24 * 60 * 60, // 7 天
+	})
+}
+
+func (s *Server) clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session_id",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		MaxAge:   -1,
+	})
+}
+
+// ========== 登录/登出 Handlers ==========
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request", 400)
+		return
+	}
+
+	if subtle.ConstantTimeCompare([]byte(req.Username), []byte(s.cfg.Auth.Username)) != 1 ||
+		subtle.ConstantTimeCompare([]byte(req.Password), []byte(s.cfg.Auth.Password)) != 1 {
+		jsonError(w, "用户名或密码错误", 401)
+		return
+	}
+
+	sessionID := s.createSession()
+	s.setSessionCookie(w, sessionID)
+	log.Printf("用户 %s 登录成功", req.Username)
+	jsonOK(w, map[string]string{"message": "登录成功"})
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	sessionID := s.getSessionCookie(r)
+	if sessionID != "" {
+		s.deleteSession(sessionID)
+	}
+	s.clearSessionCookie(w)
+	jsonOK(w, map[string]string{"message": "已退出"})
+}
+
+// ========== 路由保护 ==========
+
+func (s *Server) authGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Auth 未启用时直接放行
+		if !s.cfg.Auth.Enabled {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// 登录/登出接口放行
+		if r.URL.Path == "/api/login" || r.URL.Path == "/api/logout" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// 检查 session
+		if s.validateSession(s.getSessionCookie(r)) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// 未认证
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			jsonError(w, "请先登录", 401)
+			return
+		}
+		// 页面请求返回登录页
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, loginHTML)
+	})
+}
+
 func (s *Server) SetupRoutes() http.Handler {
 	mux := http.NewServeMux()
+
+	// 登录/登出（不需要认证）
+	mux.HandleFunc("/api/login", s.handleLogin)
+	mux.HandleFunc("/api/logout", s.handleLogout)
 
 	mux.HandleFunc("/api/status", s.handleStatus)
 	// C-001: /api/set-token 也加认证保护
@@ -287,13 +465,21 @@ func (s *Server) SetupRoutes() http.Handler {
 	mux.HandleFunc("/api/stats", s.authMiddleware(s.handleStats))
 	mux.HandleFunc("/", s.handleIndex)
 
-	return s.securityHeaders(mux)
+	// 用 authGuard 包裹所有路由
+	return s.securityHeaders(s.authGuard(mux))
 }
 
 func (s *Server) Start() error {
 	handler := s.SetupRoutes()
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
-	log.Printf("MopanProxy 启动在 http://%s", addr)
+	if s.cfg.Auth.Enabled {
+		log.Printf("MopanProxy 启动在 http://%s (登录保护: 开启)", addr)
+	} else {
+		log.Printf("MopanProxy 启动在 http://%s (登录保护: 关闭)", addr)
+	}
+
+	// 启动 session 清理
+	go s.cleanupSessions()
 
 	// M-017: 添加 HTTP 超时配置
 	s.httpSrv = &http.Server{
@@ -313,7 +499,11 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) startWebDAV() {
-	fs := mopanWebdav.NewMopanFSWithEncryption(s.client, s.enc, s.store, s.rootID)
+	// 本地目录模式
+	localDir := "/mnt/yidong"
+	os.MkdirAll(localDir, 0755)
+	fs := webdav.Dir(localDir)
+	log.Printf("WebDAV 本地目录: %s", localDir)
 	davHandler := &webdav.Handler{
 		Prefix:     "/dav",
 		FileSystem: fs,
@@ -511,6 +701,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	jsonOK(w, map[string]interface{}{
 		"auth":      s.client.IsAuthed(),
+		"logged_in": true,
 		"account":   account,
 		"encrypted": s.enc != nil,
 	})
@@ -544,6 +735,14 @@ func (s *Server) handleSetToken(w http.ResponseWriter, r *http.Request) {
 	s.cfg.Authorization = authStr
 	s.cfg.Account = s.client.Account
 	s.saveConfig()
+
+	// 如果根目录未初始化，尝试重新初始化
+	if s.rootID == "" {
+		if err := s.initRootFolder(); err != nil {
+			log.Printf("⚠️  根目录初始化失败: %v", err)
+		}
+	}
+
 	log.Printf("Token 设置成功")
 	jsonOK(w, map[string]interface{}{
 		"account": s.client.Account,

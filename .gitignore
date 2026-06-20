@@ -1,9 +1,14 @@
 # 编译产物
 mopan-proxy
 *.exe
+mopan-proxy-linux
 
 # 配置文件（含密码和 token）
 config.yaml
+
+# 证书文件（含私钥）
+*.pem
+*.key
 
 # 数据库
 *.db

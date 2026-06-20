@@ -32,6 +32,12 @@ storage:
   max_upload: 10737418240  # 10GB
   root_folder: "/MopanProxy"  # 和彩云专用根目录
 
+# Web UI 认证
+auth:
+  enabled: true
+  username: "admin"
+  password: "admin123"   # ⚠️ 请修改默认密码
+
 # Token 刷新
 refresh:
   enabled: true

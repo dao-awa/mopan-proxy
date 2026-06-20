@@ -1,5 +1,80 @@
 package server
 
+var loginHTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MopanProxy - 登录</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f0f0f;color:#e0e0e0;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.login-card{width:380px;background:#1a1a1a;border-radius:16px;padding:40px;border:1px solid #222;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+.login-card h1{font-size:22px;font-weight:600;color:#fff;text-align:center;margin-bottom:6px}
+.login-card h1 span{color:#1a73e8}
+.login-card .sub{text-align:center;color:#666;font-size:13px;margin-bottom:28px}
+.form-group{margin-bottom:18px}
+.form-group label{display:block;font-size:13px;color:#888;margin-bottom:6px}
+input{background:#111;border:1px solid #333;border-radius:8px;padding:10px 14px;color:#e0e0e0;font-size:14px;width:100%;outline:none;transition:border .2s}
+input:focus{border-color:#1a73e8}
+.btn{width:100%;padding:10px;border:none;border-radius:8px;cursor:pointer;font-size:15px;font-weight:500;background:#1a73e8;color:#fff;transition:all .2s}
+.btn:hover{background:#1557b0}
+.btn:active{transform:scale(.98)}
+.msg{padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:16px;display:none}
+.msg-err{background:#3a1a1a;color:#f44336;border:1px solid #5a2d2d;display:block}
+.icon{text-align:center;font-size:40px;margin-bottom:12px}
+</style>
+</head>
+<body>
+<div class="login-card">
+  <div class="icon">&#128274;</div>
+  <h1>&#128274; <span>Mopan</span>Proxy</h1>
+  <p class="sub">请输入用户名和密码</p>
+  <div id="errMsg" class="msg"></div>
+  <div class="form-group">
+    <label>用户名</label>
+    <input id="username" type="text" autocomplete="username" required autofocus>
+  </div>
+  <div class="form-group">
+    <label>密码</label>
+    <input id="password" type="password" autocomplete="current-password" required>
+  </div>
+  <button class="btn" type="button" id="btnLogin">登 录</button>
+</div>
+<script>
+function doLogin() {
+  var u = document.getElementById('username').value;
+  var p = document.getElementById('password').value;
+  if (!u || !p) return;
+  var btn = document.getElementById('btnLogin');
+  var err = document.getElementById('errMsg');
+  btn.disabled = true; btn.textContent = '登录中...';
+  err.className = 'msg';
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/login');
+  xhr.setRequestHeader('Content-Type', 'application/json');
+  xhr.onload = function() {
+    btn.disabled = false; btn.textContent = '登 录';
+    try {
+      var d = JSON.parse(xhr.responseText);
+      if (d.success) { location.reload(); }
+      else { err.textContent = d.error || '登录失败'; err.className = 'msg msg-err'; }
+    } catch(ex) { err.textContent = '登录失败'; err.className = 'msg msg-err'; }
+  };
+  xhr.onerror = function() { btn.disabled = false; btn.textContent = '登 录'; err.textContent = '网络错误'; err.className = 'msg msg-err'; };
+  xhr.send(JSON.stringify({username: u, password: p}));
+}
+document.getElementById('btnLogin').addEventListener('click', doLogin);
+document.getElementById('username').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') { e.preventDefault(); document.getElementById('password').focus(); }
+});
+document.getElementById('password').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') { e.preventDefault(); doLogin(); }
+});
+</script>
+</body>
+</html>`
+
 var indexHTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -247,17 +322,29 @@ function showPage(page) {
 function checkStatus() {
   apiGet('/api/status', function(d) {
     var b = document.getElementById('statusBadge');
-    if (d.data && d.data.auth) {
-      b.textContent = '✓ ' + d.data.account;
-      b.className = 'badge badge-ok';
+    if (d.success && d.data && d.data.logged_in) {
+      // 已登录 Web UI
       document.getElementById('loginPanel').classList.add('hidden');
       document.getElementById('navFiles').style.display = '';
       document.getElementById('navSettings').style.display = '';
       document.getElementById('navLogout').style.display = '';
-      showPage('files');
+      if (d.data.auth) {
+        b.textContent = '✓ ' + d.data.account;
+        b.className = 'badge badge-ok';
+        showPage('files');
+      } else {
+        b.textContent = '未连接和彩云';
+        b.className = 'badge badge-err';
+        showPage('settings');
+      }
+    } else if (d.success === false && (d.error === '请先登录' || (d.error && d.error.indexOf('登录') >= 0))) {
+      // 未登录 Web UI
+      document.getElementById('loginPanel').classList.remove('hidden');
+      document.getElementById('navFiles').style.display = 'none';
+      document.getElementById('navSettings').style.display = 'none';
+      document.getElementById('navLogout').style.display = 'none';
     } else {
-      b.textContent = '未连接';
-      b.className = 'badge badge-err';
+      // 其他错误（如网络问题）
       document.getElementById('loginPanel').classList.remove('hidden');
       document.getElementById('navFiles').style.display = 'none';
       document.getElementById('navSettings').style.display = 'none';
@@ -388,7 +475,7 @@ function updateWebdav() {
 }
 
 function logout() {
-  apiPost('/api/set-token', {authorization: ''}, function(){checkStatus()});
+  apiPost('/api/logout', {}, function(){ location.reload(); });
 }
 
 // Event delegation — H1 XSS 修复：所有交互通过 data-* 属性 + 事件委托

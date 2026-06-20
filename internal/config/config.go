@@ -43,6 +43,13 @@ type Config struct {
 		RootFolder string `yaml:"root_folder"` // 和彩云根目录（如 /MopanProxy）
 	} `yaml:"storage"`
 
+	// Web UI 认证
+	Auth struct {
+		Enabled  bool   `yaml:"enabled"`
+		Username string `yaml:"username"`
+		Password string `yaml:"password"`
+	} `yaml:"auth"`
+
 	// Token 刷新
 	Refresh struct {
 		Enabled bool `yaml:"enabled"`
@@ -67,6 +74,9 @@ func Default() *Config {
 	cfg.Storage.MaxUpload = 10 * 1024 * 1024 * 1024 // 10GB
 	cfg.Storage.RootFolder = "/MopanProxy"
 	cfg.Refresh.Enabled = true
+	cfg.Auth.Enabled = true
+	cfg.Auth.Username = "admin"
+	cfg.Auth.Password = "admin123"
 	return cfg
 }
 
