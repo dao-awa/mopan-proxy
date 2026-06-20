@@ -38,7 +38,11 @@ templates_new.go
 reference/
 mCloud/
 download/
+# 审计/内部文档（含敏感信息）
 审计报告.md
+SECURITY_AUDIT_REPORT.md
+内部文档.md
+INTERNAL.md
 
 # 逆向工程/调试文件（含敏感信息）
 *.py
