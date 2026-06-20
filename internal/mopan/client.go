@@ -145,7 +145,7 @@ func (c *Client) sendRequest(url string, data interface{}) (map[string]interface
 
 	var result map[string]interface{}
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("decode response: %v (body: %s)", err, string(respBody[:min(len(respBody), 500)]))
+		return nil, fmt.Errorf("decode response failed")
 	}
 
 	return result, nil
@@ -500,9 +500,6 @@ func (c *Client) UploadFileEncrypted(parentFileID, name string, encReader io.Rea
 		return fmt.Errorf("create file: %w", err)
 	}
 
-	respJSON, _ := json.Marshal(resp)
-	log.Printf("UploadFileEncrypted create resp: %s", string(respJSON[:min(len(respJSON), 400)]))
-
 	if success, ok := resp["success"].(bool); ok && !success {
 		msg, _ := resp["message"].(string)
 		return fmt.Errorf("create failed: %s", msg)
@@ -534,7 +531,6 @@ func (c *Client) UploadFileEncrypted(parentFileID, name string, encReader io.Rea
 				}
 
 				// 上传加密数据到 COS
-				log.Printf("UploadFileEncrypted: uploading %d bytes to COS", len(encData))
 				req, err := http.NewRequest("PUT", uploadUrl, bytes.NewReader(encData))
 				if err != nil {
 					return fmt.Errorf("create upload request: %w", err)
@@ -546,13 +542,10 @@ func (c *Client) UploadFileEncrypted(parentFileID, name string, encReader io.Rea
 				if err != nil {
 					return fmt.Errorf("upload part: %w", err)
 				}
-				uploadBody, _ := io.ReadAll(uploadResp.Body)
 				uploadResp.Body.Close()
 
-				log.Printf("UploadFileEncrypted: COS response status=%d body=%s", uploadResp.StatusCode, string(uploadBody[:min(len(uploadBody), 200)]))
-
 				if uploadResp.StatusCode >= 400 {
-					return fmt.Errorf("upload failed: status %d %s", uploadResp.StatusCode, string(uploadBody[:min(len(uploadBody), 200)]))
+					return fmt.Errorf("upload failed: status %d", uploadResp.StatusCode)
 				}
 			}
 		}
@@ -566,11 +559,10 @@ func (c *Client) UploadFileEncrypted(parentFileID, name string, encReader io.Rea
 				"fileId":               fileId,
 				"uploadId":             uploadId,
 			}
-			completeResp, err := c.sendRequest(BaseURL+"/file/complete", completeData)
+			_, err := c.sendRequest(BaseURL+"/file/complete", completeData)
 			if err != nil {
 				return fmt.Errorf("complete upload: %w", err)
 			}
-			log.Printf("UploadFileEncrypted: complete resp=%v", completeResp)
 		}
 	}
 

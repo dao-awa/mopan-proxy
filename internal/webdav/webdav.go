@@ -192,6 +192,8 @@ func (fs *MopanFS) OpenFile(ctx context.Context, name string, flags int, perm os
 	if err != nil {
 		return nil, err
 	}
+	// H-004: 临时文件权限设为仅所有者可读写
+	os.Chmod(tmpFile.Name(), 0600)
 
 	resp, err := http.Get(downloadUrl)
 	if err != nil {
@@ -201,7 +203,12 @@ func (fs *MopanFS) OpenFile(ctx context.Context, name string, flags int, perm os
 	}
 	defer resp.Body.Close()
 
-	io.Copy(tmpFile, resp.Body)
+	// L-023: 检查 io.Copy 错误
+	if _, err := io.Copy(tmpFile, resp.Body); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, err
+	}
 	tmpFile.Seek(0, 0)
 
 	// 解密
@@ -225,6 +232,7 @@ func (fs *MopanFS) OpenFile(ctx context.Context, name string, flags int, perm os
 				os.Remove(tmpFile.Name())
 				return nil, err
 			}
+			os.Chmod(decFile.Name(), 0600)
 			decFile.Write(plaintext)
 			decFile.Seek(0, 0)
 			os.Remove(tmpFile.Name())
@@ -246,6 +254,7 @@ func (fs *MopanFS) Create(ctx context.Context, name string, flags int, perm os.F
 	if err != nil {
 		return nil, err
 	}
+	os.Chmod(tmpFile.Name(), 0600)
 	return &mopanWriteFile{File: tmpFile, fs: fs, name: name}, nil
 }
 
@@ -520,12 +529,14 @@ func (f *mopanWriteFile) Close() error {
 		}
 
 		if f.fs.store != nil {
+			// M-025: 修复重试循环 break 逻辑
 			for retry := 0; retry < 10; retry++ {
 				time.Sleep(time.Duration(300+retry*200) * time.Millisecond)
 				resp, err := f.fs.client.ListFiles(parentID, "")
 				if err != nil {
 					continue
 				}
+				found := false
 				for _, item := range resp.Data.Items {
 					if item.Name == encName {
 						f.fs.store.PutFile(&metadata.FileInfo{
@@ -542,10 +553,13 @@ func (f *mopanWriteFile) Close() error {
 							CreatedAt:     time.Now(),
 							UpdatedAt:     time.Now(),
 						})
+						found = true
 						break
 					}
 				}
-				break
+				if found {
+					break
+				}
 			}
 		}
 	} else {

@@ -3,15 +3,18 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"mopan-proxy/internal/config"
 	"mopan-proxy/internal/crypto"
@@ -31,9 +34,6 @@ type Server struct {
 	webDir     string
 	rootID     string
 
-	syncMu     sync.Mutex
-	syncing    bool
-	syncLog    []string
 	saveMu     sync.Mutex
 	httpSrv    *http.Server
 	webdavSrv  *http.Server
@@ -42,7 +42,20 @@ type Server struct {
 
 func New(cfg *config.Config, configPath string) (*Server, error) {
 	client := mopan.NewClient(cfg.Account, cfg.Authorization)
-	os.MkdirAll(cfg.Storage.CacheDir, 0755)
+	os.MkdirAll(cfg.Storage.CacheDir, 0700)
+
+	// C-002: WebDAV 启用时强制要求非空凭据
+	if cfg.WebDAV.Enabled && (cfg.WebDAV.Username == "" || cfg.WebDAV.Password == "") {
+		return nil, fmt.Errorf("WebDAV 已启用但用户名或密码为空，请在 config.yaml 中配置 webdav.username 和 webdav.password")
+	}
+
+	// M-001: 检测默认密码并警告
+	if cfg.Crypto.Password == "mopan-default-password" {
+		log.Println("⚠️  警告: 正在使用默认加密密码，请在 config.yaml 中修改 crypto.password")
+	}
+	if cfg.WebDAV.Password == "admin" && cfg.WebDAV.Username == "admin" {
+		log.Println("⚠️  警告: 正在使用默认 WebDAV 凭据 admin/admin，请修改")
+	}
 
 	var enc *crypto.Encryptor
 	if cfg.Crypto.Enabled {
@@ -94,7 +107,6 @@ func (s *Server) Shutdown(ctx context.Context) {
 	}
 }
 
-// initRootFolder 在和彩云上找到或创建根目录
 func (s *Server) initRootFolder() error {
 	rootFolder := s.cfg.Storage.RootFolder
 	if rootFolder == "" || rootFolder == "/" {
@@ -109,28 +121,26 @@ func (s *Server) initRootFolder() error {
 			for _, item := range resp.Data.Items {
 				if item.FileId == cachedID {
 					s.rootID = cachedID
-					log.Printf("根目录: %s (cached, id=%s)", rootFolder, cachedID)
+					log.Printf("根目录: %s (cached)", rootFolder)
 					return nil
 				}
 			}
 		}
 	}
 
-	// 尝试查找根目录（可能是加密名或旧版名）
 	rootName := strings.TrimPrefix(rootFolder, "/")
 	resp, err := s.client.ListFiles("/", "")
 	if err != nil {
 		return fmt.Errorf("list root: %w", err)
 	}
 
-	// 先尝试从 SQLite 查找根目录
 	if s.store != nil && s.enc != nil {
 		encName := s.enc.EncNameForFolder(rootName)
 		for _, item := range resp.Data.Items {
 			if item.Name == encName || item.Name == rootName || item.Name == rootName+"_enc" {
 				s.rootID = item.FileId
 				s.store.SetConfig("root_cloud_id", s.rootID)
-				log.Printf("根目录: %s (found, id=%s)", rootFolder, s.rootID)
+				log.Printf("根目录: %s (found)", rootFolder)
 				return nil
 			}
 		}
@@ -139,13 +149,12 @@ func (s *Server) initRootFolder() error {
 			if item.Name == rootName {
 				s.rootID = item.FileId
 				s.store.SetConfig("root_cloud_id", s.rootID)
-				log.Printf("根目录: %s (found, id=%s)", rootFolder, s.rootID)
+				log.Printf("根目录: %s (found)", rootFolder)
 				return nil
 			}
 		}
 	}
 
-	// 根目录不存在，创建
 	log.Printf("根目录 %s 不存在，正在创建...", rootFolder)
 	encRootName := rootName
 	if s.enc != nil {
@@ -165,7 +174,6 @@ func (s *Server) initRootFolder() error {
 			if item.Name == encRootName || item.Name == rootName {
 				s.rootID = item.FileId
 				s.store.SetConfig("root_cloud_id", s.rootID)
-				// 存储元数据
 				if s.store != nil && s.enc != nil {
 					s.store.PutFile(&metadata.FileInfo{
 						CloudFileID:   item.FileId,
@@ -178,7 +186,7 @@ func (s *Server) initRootFolder() error {
 						UpdatedAt:     time.Now(),
 					})
 				}
-				log.Printf("根目录: %s (created, id=%s)", rootFolder, s.rootID)
+				log.Printf("根目录: %s (created)", rootFolder)
 				return nil
 			}
 		}
@@ -199,12 +207,28 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// H-003: CSRF 保护 — 检查 X-Requested-With + Origin/Referer
 func (s *Server) csrfMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" {
 			if r.Header.Get("X-Requested-With") == "" {
 				jsonError(w, "CSRF 验证失败", 403)
 				return
+			}
+			// 额外检查 Origin 或 Referer（如果提供了的话）
+			origin := r.Header.Get("Origin")
+			referer := r.Header.Get("Referer")
+			if origin != "" {
+				if !strings.HasPrefix(origin, "http://localhost") && !strings.HasPrefix(origin, "https://localhost") &&
+					!strings.HasPrefix(origin, "http://"+s.cfg.Host) && !strings.HasPrefix(origin, "https://"+s.cfg.Host) {
+					jsonError(w, "CSRF 验证失败", 403)
+					return
+				}
+			} else if referer != "" {
+				if !strings.Contains(referer, "localhost") && !strings.Contains(referer, s.cfg.Host) {
+					jsonError(w, "CSRF 验证失败", 403)
+					return
+				}
 			}
 		}
 		next(w, r)
@@ -216,7 +240,7 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -228,11 +252,31 @@ func (s *Server) maxBytesMiddleware(maxBytes int64, next http.HandlerFunc) http.
 	}
 }
 
+// sanitizeName 清理文件/文件夹名称：移除控制字符、空字节、限制长度
+func sanitizeName(name string) string {
+	// L-010: 移除空字节和控制字符
+	var b strings.Builder
+	for _, r := range name {
+		if r == 0 || unicode.IsControl(r) && r != '\t' {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	name = b.String()
+	name = strings.TrimSpace(name)
+	// 限制长度
+	if len(name) > 255 {
+		name = name[:255]
+	}
+	return name
+}
+
 func (s *Server) SetupRoutes() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/status", s.handleStatus)
-	mux.HandleFunc("/api/set-token", s.csrfMiddleware(s.handleSetToken))
+	// C-001: /api/set-token 也加认证保护
+	mux.HandleFunc("/api/set-token", s.authMiddleware(s.csrfMiddleware(s.handleSetToken)))
 	mux.HandleFunc("/api/files", s.authMiddleware(s.handleListFiles))
 	mux.HandleFunc("/api/mkdir", s.authMiddleware(s.maxBytesMiddleware(1<<20, s.handleMkdir)))
 	mux.HandleFunc("/api/delete", s.authMiddleware(s.csrfMiddleware(s.maxBytesMiddleware(1<<20, s.handleDelete))))
@@ -251,7 +295,15 @@ func (s *Server) Start() error {
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
 	log.Printf("MopanProxy 启动在 http://%s", addr)
 
-	s.httpSrv = &http.Server{Addr: addr, Handler: handler}
+	// M-017: 添加 HTTP 超时配置
+	s.httpSrv = &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      30 * time.Minute, // 上传需要长时间
+		IdleTimeout:       120 * time.Second,
+	}
 
 	if s.cfg.WebDAV.Enabled {
 		go s.startWebDAV()
@@ -273,14 +325,15 @@ func (s *Server) startWebDAV() {
 		},
 	}
 
+	// H-002: 使用 ConstantTimeCompare 防时序攻击
 	authHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.WebDAV.Username != "" {
-			user, pass, ok := r.BasicAuth()
-			if !ok || user != s.cfg.WebDAV.Username || pass != s.cfg.WebDAV.Password {
-				w.Header().Set("WWW-Authenticate", `Basic realm="MopanProxy WebDAV"`)
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
-				return
-			}
+		user, pass, ok := r.BasicAuth()
+		if !ok ||
+			subtle.ConstantTimeCompare([]byte(user), []byte(s.cfg.WebDAV.Username)) != 1 ||
+			subtle.ConstantTimeCompare([]byte(pass), []byte(s.cfg.WebDAV.Password)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="MopanProxy WebDAV"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
 		}
 		davHandler.ServeHTTP(w, r)
 	})
@@ -288,7 +341,14 @@ func (s *Server) startWebDAV() {
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.WebDAV.Port)
 	log.Printf("WebDAV 服务器启动在 http://%s/dav/", addr)
 
-	s.webdavSrv = &http.Server{Addr: addr, Handler: authHandler}
+	s.webdavSrv = &http.Server{
+		Addr:              addr,
+		Handler:           authHandler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      30 * time.Minute,
+		IdleTimeout:       120 * time.Second,
+	}
 	if err := s.webdavSrv.ListenAndServe(); err != nil && err.Error() != "http: Server closed" {
 		log.Printf("WebDAV 服务器错误: %v", err)
 	}
@@ -310,12 +370,10 @@ func (s *Server) encFileName(name string) string {
 	return s.enc.EncNameForFile(name)
 }
 
-// origName 从云端名称还原原始名称
 func (s *Server) origName(cloudName string, isFolder bool) string {
 	if s.enc == nil {
 		return cloudName
 	}
-	// 新版加密名：hex 名称
 	if isFolder {
 		if orig, ok := s.enc.DecNameForFolder(cloudName); ok {
 			return orig
@@ -325,7 +383,6 @@ func (s *Server) origName(cloudName string, isFolder bool) string {
 			return orig
 		}
 	}
-	// 旧版兼容：_enc / .enc 后缀
 	if isFolder && strings.HasSuffix(cloudName, "_enc") {
 		return strings.TrimSuffix(cloudName, "_enc")
 	}
@@ -337,9 +394,9 @@ func (s *Server) origName(cloudName string, isFolder bool) string {
 
 // ========== 路径解析 ==========
 
-// resolvePath 将用户路径解析为和彩云 fileID
-// 支持：原始名、新版加密名(hex)、旧版加密名(_enc/.enc)
 func (s *Server) resolvePath(path string) (string, error) {
+	// L-010: 路径规范化
+	path = filepath.Clean(path)
 	path = strings.Trim(path, "/")
 	if path == "" {
 		return s.rootID, nil
@@ -361,18 +418,13 @@ func (s *Server) resolvePath(path string) (string, error) {
 		found := false
 		for _, item := range resp.Data.Items {
 			isFolder := item.Type == "folder"
-
-			// 1. 精确匹配原始名/旧版加密名
 			if item.Name == part {
 				currentID = item.FileId
 				found = true
 				break
 			}
-
-			// 2. 新版名称加密匹配（通过 SQLite 查原始名）
 			if s.enc != nil {
-				origName := s.origName(item.Name, isFolder)
-				if origName == part {
+				if s.origName(item.Name, isFolder) == part {
 					currentID = item.FileId
 					found = true
 					break
@@ -388,8 +440,8 @@ func (s *Server) resolvePath(path string) (string, error) {
 	return currentID, nil
 }
 
-// resolvePathForUpload 为上传解析路径（只匹配目录）
 func (s *Server) resolvePathForUpload(path string) (string, error) {
+	path = filepath.Clean(path)
 	path = strings.Trim(path, "/")
 	if path == "" {
 		return s.rootID, nil
@@ -413,20 +465,15 @@ func (s *Server) resolvePathForUpload(path string) (string, error) {
 			if item.Type != "folder" {
 				continue
 			}
-			// 精确匹配
 			if item.Name == part {
 				currentID = item.FileId
 				found = true
 				break
 			}
-			// 名称加密匹配
-			if s.enc != nil {
-				origName := s.origName(item.Name, true)
-				if origName == part {
-					currentID = item.FileId
-					found = true
-					break
-				}
+			if s.enc != nil && s.origName(item.Name, true) == part {
+				currentID = item.FileId
+				found = true
+				break
 			}
 		}
 
@@ -438,7 +485,6 @@ func (s *Server) resolvePathForUpload(path string) (string, error) {
 	return currentID, nil
 }
 
-// findItemByName 轮询查找新创建的文件/目录
 func (s *Server) findItemByName(parentID, encName string, maxRetries int) (string, bool) {
 	for retry := 0; retry < maxRetries; retry++ {
 		time.Sleep(time.Duration(300+retry*200) * time.Millisecond)
@@ -458,11 +504,15 @@ func (s *Server) findItemByName(parentID, encName string, maxRetries int) (strin
 // ========== API Handlers ==========
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	// M-002: 隐藏手机号，只显示部分
+	account := s.client.Account
+	if len(account) > 3 {
+		account = account[:3] + "****"
+	}
 	jsonOK(w, map[string]interface{}{
 		"auth":      s.client.IsAuthed(),
-		"account":   s.client.Account,
+		"account":   account,
 		"encrypted": s.enc != nil,
-		"root_id":   s.rootID,
 	})
 }
 
@@ -494,7 +544,7 @@ func (s *Server) handleSetToken(w http.ResponseWriter, r *http.Request) {
 	s.cfg.Authorization = authStr
 	s.cfg.Account = s.client.Account
 	s.saveConfig()
-	log.Printf("Token 设置成功: %s", s.client.Account)
+	log.Printf("Token 设置成功")
 	jsonOK(w, map[string]interface{}{
 		"account": s.client.Account,
 		"message": "Token 设置成功",
@@ -527,7 +577,6 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 		size := f.Size
 		isEncrypted := s.enc != nil
 
-		// 用元数据还原
 		if s.store != nil {
 			info, err := s.store.GetFileByID(f.FileId)
 			if err == nil && info != nil {
@@ -573,6 +622,13 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// M-008: 输入验证
+	req.Name = sanitizeName(req.Name)
+	if req.Name == "" {
+		jsonError(w, "文件夹名称不能为空", 400)
+		return
+	}
+
 	parentID, err := s.resolvePathForUpload(req.ParentID)
 	if err != nil {
 		jsonError(w, "路径不存在", 404)
@@ -610,6 +666,15 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "invalid request", 400)
+		return
+	}
+	// L-011: 数组长度限制
+	if len(req.FileIDs) == 0 {
+		jsonError(w, "file_ids 不能为空", 400)
+		return
+	}
+	if len(req.FileIDs) > 100 {
+		jsonError(w, "单次最多删除 100 个文件", 400)
 		return
 	}
 	if err := s.client.DeleteFiles(req.FileIDs); err != nil {
@@ -669,25 +734,24 @@ func (s *Server) downloadDecrypted(w http.ResponseWriter, r *http.Request, fileI
 	}
 	plaintext, err := s.enc.Decrypt(ciphertext)
 	if err != nil {
-		http.Error(w, "decrypt failed", 500)
+		http.Error(w, "解密失败", 500)
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", info.OrigSize))
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, info.OrigName))
+	// M-009: Content-Disposition 文件名转义
+	escapedName := strings.ReplaceAll(info.OrigName, `\`, `\\`)
+	escapedName = strings.ReplaceAll(escapedName, `"`, `\"`)
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, escapedName))
 	w.Write(plaintext)
 }
 
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
-	maskedPass := "****"
-	if s.cfg.WebDAV.Password == "" {
-		maskedPass = ""
-	}
 	jsonOK(w, map[string]interface{}{
-		"account":            s.cfg.Account,
+		"account":            s.client.Account,
 		"webdav_port":        s.cfg.WebDAV.Port,
 		"webdav_user":        s.cfg.WebDAV.Username,
-		"webdav_pass":        maskedPass,
+		"webdav_pass":        "****",
 		"webdav_enabled":     s.cfg.WebDAV.Enabled,
 		"port":               s.cfg.Port,
 		"encryption_enabled": s.enc != nil,
@@ -722,6 +786,11 @@ func (s *Server) handleSettingsUpdate(w http.ResponseWriter, r *http.Request) {
 	if req.WebDAVEnabled != nil {
 		s.cfg.WebDAV.Enabled = *req.WebDAVEnabled
 	}
+	// C-002: 保存前验证 WebDAV 凭据非空
+	if s.cfg.WebDAV.Enabled && (s.cfg.WebDAV.Username == "" || s.cfg.WebDAV.Password == "") {
+		jsonError(w, "WebDAV 用户名和密码不能为空", 400)
+		return
+	}
 	s.saveConfig()
 	jsonOK(w, map[string]string{"message": "设置已保存"})
 }
@@ -741,8 +810,6 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"total_orig_size": origSize,
 		"total_enc_size":  encSize,
 		"encryption":      s.enc != nil,
-		"root_folder":     s.cfg.Storage.RootFolder,
-		"root_id":         s.rootID,
 	})
 }
 
@@ -775,6 +842,13 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
+	// M-007: 文件名验证
+	filename := sanitizeName(header.Filename)
+	if filename == "" {
+		jsonError(w, "文件名无效", 400)
+		return
+	}
+
 	parentPath := r.FormValue("path")
 	if parentPath == "" {
 		parentPath = "/"
@@ -787,11 +861,11 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.enc != nil {
-		s.uploadEncrypted(w, parentID, header.Filename, file, header.Size)
+		s.uploadEncrypted(w, parentID, filename, file, header.Size)
 		return
 	}
 
-	if err := s.client.UploadFile(parentID, header.Filename, file, header.Size); err != nil {
+	if err := s.client.UploadFile(parentID, filename, file, header.Size); err != nil {
 		jsonError(w, "上传失败", 500)
 		return
 	}
@@ -822,7 +896,6 @@ func (s *Server) uploadEncrypted(w http.ResponseWriter, parentID, filename strin
 		return
 	}
 
-	// 提取 nonce
 	var nonce []byte
 	if len(encrypted) >= crypto.NonceSize {
 		nonce = make([]byte, crypto.NonceSize)

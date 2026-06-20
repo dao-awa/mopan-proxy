@@ -96,7 +96,7 @@ func (e *Encryptor) Decrypt(data []byte) ([]byte, error) {
 
 	minSize := gcm.NonceSize() + gcm.Overhead()
 	if len(data) < minSize {
-		return nil, fmt.Errorf("ciphertext too short: %d < %d", len(data), minSize)
+		return nil, fmt.Errorf("invalid ciphertext")
 	}
 
 	nonce := data[:gcm.NonceSize()]
@@ -104,7 +104,7 @@ func (e *Encryptor) Decrypt(data []byte) ([]byte, error) {
 
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return nil, fmt.Errorf("decrypt failed (wrong key or corrupted data): %w", err)
+		return nil, fmt.Errorf("decrypt failed")
 	}
 
 	return plaintext, nil
