@@ -1,0 +1,37 @@
+# MopanProxy 配置文件模板
+# 复制为 config.yaml 后修改
+
+# 服务器
+port: 9090
+host: "0.0.0.0"
+debug: false
+
+# 和彩云认证
+# 获取方式: 浏览器登录 yun.139.com → F12 → Network → 复制 Authorization 头
+account: ""
+authorization: ""
+
+# WebDAV
+webdav:
+  enabled: true
+  port: 9091
+  username: "admin"
+  password: "admin123"    # ⚠️ 请修改默认密码
+
+# 加密
+crypto:
+  enabled: true
+  password: "change-me"   # ⚠️ 务必修改！丢失此密码将无法解密文件
+  salt_hex: ""            # 自动生成，勿手动修改
+  iterations: 100000
+
+# 存储
+storage:
+  cache_dir: "./data/cache"
+  meta_path: "./data/metadata.db"
+  max_upload: 10737418240  # 10GB
+  root_folder: "/MopanProxy"  # 和彩云专用根目录
+
+# Token 刷新
+refresh:
+  enabled: true

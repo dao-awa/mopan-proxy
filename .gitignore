@@ -1,0 +1,47 @@
+# 编译产物
+mopan-proxy
+*.exe
+
+# 配置文件（含密码和 token）
+config.yaml
+
+# 数据库
+*.db
+*.db-wal
+*.db-shm
+
+# 数据目录
+data/
+
+# 缓存
+cache/
+tmp/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+__pycache__/
+
+# 旧版/遗留文件
+client_v2.go
+server_v2.go
+templates_v2.go
+client_new.go
+server_new.go
+templates_new.go
+reference/
+mCloud/
+download/
+审计报告.md
+
+# 逆向工程/调试文件（含敏感信息）
+*.py
+*.js
+*.json
+!go.sum
