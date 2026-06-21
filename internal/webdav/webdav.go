@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -64,8 +65,9 @@ func (fs *MopanFS) origName(cloudName string, isFolder bool) string {
 // ========== 目录操作 ==========
 
 func (fs *MopanFS) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
-	parent, base := splitPath(name)
-	if base == "" {
+	parent := path.Dir(name)
+	base := path.Base(name)
+	if base == "." || base == "/" {
 		return nil
 	}
 	parentID, err := fs.resolvePath(parent)
@@ -274,7 +276,14 @@ func (fs *MopanFS) stat(name string) (os.FileInfo, error) {
 		return &dirInfo{name: "/", size: 0, modTime: time.Now()}, nil
 	}
 
-	parent, base := splitPath(name)
+	// 处理尾部斜杠："/qb/" → 查找 "qb" 目录
+	name = strings.TrimRight(name, "/")
+	if name == "" {
+		return &dirInfo{name: "/", size: 0, modTime: time.Now()}, nil
+	}
+
+	parent := path.Dir(name)
+	base := path.Base(name)
 	parentID, err := fs.resolvePath(parent)
 	if err != nil {
 		return nil, err
@@ -290,7 +299,7 @@ func (fs *MopanFS) stat(name string) (os.FileInfo, error) {
 		isFolder := item.Type == "folder"
 		origName := fs.origName(item.Name, isFolder)
 
-		if origName == base {
+		if origName == base || item.Name == base {
 			if isFolder {
 				return &dirInfo{name: base, size: 0, modTime: parseTime(item.UpdatedAt)}, nil
 			}
@@ -329,7 +338,7 @@ func (fs *MopanFS) stat(name string) (os.FileInfo, error) {
 		}
 	}
 
-	return nil, os.ErrNotExist
+	return nil, &os.PathError{Op: "stat", Path: name, Err: os.ErrNotExist}
 }
 
 // ========== 路径解析 ==========
@@ -387,7 +396,7 @@ func (fs *MopanFS) resolvePath(name string) (string, error) {
 		}
 
 		if !found {
-			return "", os.ErrNotExist
+			return "", &os.PathError{Op: "resolve", Path: name, Err: os.ErrNotExist}
 		}
 	}
 
@@ -483,47 +492,15 @@ func (d *mopanDir) Readdir(count int) ([]os.FileInfo, error) {
 		}
 		for _, item := range resp.Data.Items {
 			isFolder := item.Type == "folder"
-			name := item.Name // 默认使用云端原始名称
+			// 使用解密后的原始名，让 WebDAV 客户端（rclone）看到真实名称
+			name := d.fs.origName(item.Name, isFolder)
 			size := item.Size
 
-			// 名称解析回退链: 1) 按ID查元数据 → 2) 按名称查元数据 → 3) 加密解密
-			resolved := false
-			if d.fs.store != nil {
-				// 优先级1: 按 cloud_file_id 查找
+			// 仅对文件做元数据大小修正
+			if !isFolder && d.fs.store != nil {
 				if info, _ := d.fs.store.GetFileByID(item.FileId); info != nil {
-					name = info.OrigName
 					size = info.OrigSize
-					resolved = true
 				}
-				// 优先级2: 按 cloud_name + parent 查找（含时间戳去除）
-				if !resolved {
-					if info, _ := d.fs.store.GetFileByName(item.Name, parentID); info != nil {
-						name = info.OrigName
-						size = info.OrigSize
-						resolved = true
-						// 补充 ID 映射
-						info.CloudFileID = item.FileId
-						d.fs.store.PutFile(info)
-					}
-				}
-				// 优先级3: 加密解密（含时间戳去除）
-				if !resolved {
-					decName := d.fs.origName(item.Name, isFolder)
-					if decName != item.Name {
-						name = decName
-						resolved = true
-					}
-				}
-				// 优先级4: 按 orig_name 反向查找（处理云端文件夹被重命名后 ID 不匹配的情况）
-				if !resolved && isFolder {
-					if info, _ := d.fs.store.GetFileByOrigName(item.Name, ""); info != nil && info.Type == "folder" {
-						name = info.OrigName
-						resolved = true
-					}
-				}
-			} else {
-				// 无元数据时直接解密
-				name = d.fs.origName(item.Name, isFolder)
 			}
 
 			if isFolder {
@@ -572,7 +549,9 @@ func (f *mopanWriteFile) Close() error {
 		return err
 	}
 
-	parent, base := splitPath(f.name)
+	// 使用 path.Dir/Base 正确处理多级路径（splitPath 只在第一个 / 分割）
+	parent := path.Dir(f.name)
+	base := path.Base(f.name)
 	parentID, err := f.fs.resolvePath(parent)
 	if err != nil {
 		os.Remove(f.File.Name())
