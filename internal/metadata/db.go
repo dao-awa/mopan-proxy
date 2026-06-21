@@ -173,6 +173,70 @@ func (s *Store) GetFilesByParent(parentCloudID string) ([]*FileInfo, error) {
 	return files, nil
 }
 
+// GetFileByOrigName 按 orig_name 查找（parentCloudID 为空时不限父目录）
+func (s *Store) GetFileByOrigName(origName, parentCloudID string) (*FileInfo, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	info := &FileInfo{}
+	var err error
+	if parentCloudID != "" {
+		err = s.db.QueryRow(`
+			SELECT cloud_file_id, parent_cloud_id, cloud_name, orig_name, orig_path, type,
+			       orig_size, enc_size, nonce, content_hash, is_encrypted, created_at, updated_at
+			FROM files WHERE orig_name = ? AND parent_cloud_id = ?
+			LIMIT 1
+		`, origName, parentCloudID).Scan(
+			&info.CloudFileID, &info.ParentCloudID, &info.CloudName, &info.OrigName, &info.OrigPath, &info.Type,
+			&info.OrigSize, &info.EncSize, &info.Nonce, &info.ContentHash, &info.IsEncrypted,
+			&info.CreatedAt, &info.UpdatedAt,
+		)
+	} else {
+		err = s.db.QueryRow(`
+			SELECT cloud_file_id, parent_cloud_id, cloud_name, orig_name, orig_path, type,
+			       orig_size, enc_size, nonce, content_hash, is_encrypted, created_at, updated_at
+			FROM files WHERE orig_name = ?
+			LIMIT 1
+		`, origName).Scan(
+			&info.CloudFileID, &info.ParentCloudID, &info.CloudName, &info.OrigName, &info.OrigPath, &info.Type,
+			&info.OrigSize, &info.EncSize, &info.Nonce, &info.ContentHash, &info.IsEncrypted,
+			&info.CreatedAt, &info.UpdatedAt,
+		)
+	}
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
+// GetFileByName 按 cloud_name + parent_cloud_id 查询
+func (s *Store) GetFileByName(cloudName, parentCloudID string) (*FileInfo, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	info := &FileInfo{}
+	err := s.db.QueryRow(`
+		SELECT cloud_file_id, parent_cloud_id, cloud_name, orig_name, orig_path, type,
+		       orig_size, enc_size, nonce, content_hash, is_encrypted, created_at, updated_at
+		FROM files WHERE cloud_name = ? AND parent_cloud_id = ?
+	`, cloudName, parentCloudID).Scan(
+		&info.CloudFileID, &info.ParentCloudID, &info.CloudName, &info.OrigName, &info.OrigPath, &info.Type,
+		&info.OrigSize, &info.EncSize, &info.Nonce, &info.ContentHash, &info.IsEncrypted,
+		&info.CreatedAt, &info.UpdatedAt,
+	)
+	if err == nil {
+		return info, nil
+	}
+	if err != sql.ErrNoRows {
+		return nil, err
+	}
+
+	return nil, nil
+}
+
 // DeleteFile 删除文件元数据
 func (s *Store) DeleteFile(cloudFileID string) error {
 	s.mu.Lock()

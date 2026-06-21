@@ -285,6 +285,7 @@ func (fs *MopanFS) stat(name string) (os.FileInfo, error) {
 		return nil, err
 	}
 
+	// 第一轮：精确匹配 + 加密解密匹配
 	for _, item := range resp.Data.Items {
 		isFolder := item.Type == "folder"
 		origName := fs.origName(item.Name, isFolder)
@@ -301,6 +302,30 @@ func (fs *MopanFS) stat(name string) (os.FileInfo, error) {
 				}
 			}
 			return &fileInfo{name: base, size: fSize, modTime: parseTime(item.UpdatedAt)}, nil
+		}
+	}
+
+	// 第二轮：元数据反向查找
+	if fs.store != nil {
+		if info, _ := fs.store.GetFileByOrigName(base, parentID); info != nil {
+			for _, item := range resp.Data.Items {
+				if item.FileId == info.CloudFileID {
+					if info.Type == "folder" {
+						return &dirInfo{name: base, size: 0, modTime: parseTime(item.UpdatedAt)}, nil
+					}
+					return &fileInfo{name: base, size: info.OrigSize, modTime: parseTime(item.UpdatedAt)}, nil
+				}
+			}
+		}
+		if info, _ := fs.store.GetFileByOrigName(base, ""); info != nil {
+			for _, item := range resp.Data.Items {
+				if item.FileId == info.CloudFileID {
+					if info.Type == "folder" {
+						return &dirInfo{name: base, size: 0, modTime: parseTime(item.UpdatedAt)}, nil
+					}
+					return &fileInfo{name: base, size: info.OrigSize, modTime: parseTime(item.UpdatedAt)}, nil
+				}
+			}
 		}
 	}
 
@@ -324,6 +349,7 @@ func (fs *MopanFS) resolvePath(name string) (string, error) {
 
 		resp, err := fs.client.ListFiles(currentID, "")
 		if err != nil {
+			log.Printf("resolvePath: list failed for parentID=%s: %v", currentID, err)
 			return "", fmt.Errorf("list failed")
 		}
 
@@ -331,17 +357,28 @@ func (fs *MopanFS) resolvePath(name string) (string, error) {
 		for _, item := range resp.Data.Items {
 			isFolder := item.Type == "folder"
 
-			// 1. 精确匹配（旧版兼容）
 			if item.Name == part {
 				currentID = item.FileId
 				found = true
 				break
 			}
 
-			// 2. 解密匹配（新版加密名）
 			if fs.enc != nil {
 				origName := fs.origName(item.Name, isFolder)
 				if origName == part {
+					currentID = item.FileId
+					found = true
+					break
+				}
+			}
+
+			if fs.store != nil {
+				if info, err := fs.store.GetFileByID(item.FileId); err == nil && info != nil && info.OrigName == part {
+					currentID = item.FileId
+					found = true
+					break
+				}
+				if info, err := fs.store.GetFileByName(item.Name, currentID); err == nil && info != nil && info.OrigName == part {
 					currentID = item.FileId
 					found = true
 					break
@@ -446,19 +483,49 @@ func (d *mopanDir) Readdir(count int) ([]os.FileInfo, error) {
 		}
 		for _, item := range resp.Data.Items {
 			isFolder := item.Type == "folder"
-			name := d.fs.origName(item.Name, isFolder)
+			name := item.Name // 默认使用云端原始名称
 			size := item.Size
+
+			// 名称解析回退链: 1) 按ID查元数据 → 2) 按名称查元数据 → 3) 加密解密
+			resolved := false
 			if d.fs.store != nil {
-				info, _ := d.fs.store.GetFileByID(item.FileId)
-				if info != nil {
+				// 优先级1: 按 cloud_file_id 查找
+				if info, _ := d.fs.store.GetFileByID(item.FileId); info != nil {
 					name = info.OrigName
-					if isFolder {
-						size = 0
-					} else {
+					size = info.OrigSize
+					resolved = true
+				}
+				// 优先级2: 按 cloud_name + parent 查找（含时间戳去除）
+				if !resolved {
+					if info, _ := d.fs.store.GetFileByName(item.Name, parentID); info != nil {
+						name = info.OrigName
 						size = info.OrigSize
+						resolved = true
+						// 补充 ID 映射
+						info.CloudFileID = item.FileId
+						d.fs.store.PutFile(info)
 					}
 				}
+				// 优先级3: 加密解密（含时间戳去除）
+				if !resolved {
+					decName := d.fs.origName(item.Name, isFolder)
+					if decName != item.Name {
+						name = decName
+						resolved = true
+					}
+				}
+				// 优先级4: 按 orig_name 反向查找（处理云端文件夹被重命名后 ID 不匹配的情况）
+				if !resolved && isFolder {
+					if info, _ := d.fs.store.GetFileByOrigName(item.Name, ""); info != nil && info.Type == "folder" {
+						name = info.OrigName
+						resolved = true
+					}
+				}
+			} else {
+				// 无元数据时直接解密
+				name = d.fs.origName(item.Name, isFolder)
 			}
+
 			if isFolder {
 				d.files = append(d.files, &dirInfo{name: name, size: 0, modTime: parseTime(item.UpdatedAt)})
 			} else {
@@ -521,7 +588,7 @@ func (f *mopanWriteFile) Close() error {
 		encName := f.fs.enc.EncNameForFile(base)
 		plainHash := crypto.PlainTextHash(plaintext)
 
-		err = f.fs.client.UploadFileEncrypted(parentID, encName, bytes.NewReader(encrypted), int64(len(encrypted)), plainHash)
+		uploadResult, err := f.fs.client.UploadFileEncrypted(parentID, encName, bytes.NewReader(encrypted), int64(len(encrypted)), plainHash)
 		if err != nil {
 			os.Remove(f.File.Name())
 			return err
@@ -534,37 +601,48 @@ func (f *mopanWriteFile) Close() error {
 		}
 
 		if f.fs.store != nil {
-			// M-025: 修复重试循环 break 逻辑
-			for retry := 0; retry < 10; retry++ {
-				time.Sleep(time.Duration(300+retry*200) * time.Millisecond)
-				resp, err := f.fs.client.ListFiles(parentID, "")
-				if err != nil {
-					continue
-				}
-				found := false
-				for _, item := range resp.Data.Items {
-					if item.Name == encName {
-						f.fs.store.PutFile(&metadata.FileInfo{
-							CloudFileID:   item.FileId,
-							ParentCloudID: parentID,
-							CloudName:     encName,
-							OrigName:      base,
-							Type:          "file",
-							OrigSize:      info.Size(),
-							EncSize:       int64(len(encrypted)),
-							Nonce:         nonce,
-							ContentHash:   plainHash,
-							IsEncrypted:   true,
-							CreatedAt:     time.Now(),
-							UpdatedAt:     time.Now(),
-						})
-						found = true
+			actualFileId := uploadResult.FileId
+			actualCloudName := encName // 默认用加密名，如果云端重命名了则通过列表查找
+
+			// 如果秒传/快传，需要查找文件 ID
+			if actualFileId == "" && uploadResult.Exist {
+				for retry := 0; retry < 5; retry++ {
+					time.Sleep(time.Duration(300+retry*200) * time.Millisecond)
+					resp, err := f.fs.client.ListFiles(parentID, "")
+					if err != nil {
+						continue
+					}
+					for _, item := range resp.Data.Items {
+						if item.Name == encName {
+							actualFileId = item.FileId
+							actualCloudName = item.Name
+							break
+						}
+					}
+					if actualFileId != "" {
 						break
 					}
 				}
-				if found {
-					break
-				}
+			}
+
+			if actualFileId != "" {
+				f.fs.store.PutFile(&metadata.FileInfo{
+					CloudFileID:   actualFileId,
+					ParentCloudID: parentID,
+					CloudName:     actualCloudName,
+					OrigName:      base,
+					Type:          "file",
+					OrigSize:      info.Size(),
+					EncSize:       int64(len(encrypted)),
+					Nonce:         nonce,
+					ContentHash:   plainHash,
+					IsEncrypted:   true,
+					CreatedAt:     time.Now(),
+					UpdatedAt:     time.Now(),
+				})
+				log.Printf("WebDAV Upload metadata: '%s' -> cloud '%s' (id=%s)", base, actualCloudName, actualFileId)
+			} else {
+				log.Printf("WebDAV Upload metadata: WARNING cannot find file ID for '%s'", base)
 			}
 		}
 	} else {

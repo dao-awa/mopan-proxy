@@ -463,12 +463,19 @@ func extractUploadId(uploadUrl string) string {
 	return u.Query().Get("uploadId")
 }
 
-// UploadFileEncrypted 上传加密文件（调用方已完成加密）
-func (c *Client) UploadFileEncrypted(parentFileID, name string, encReader io.Reader, encSize int64, plainHash string) error {
+// UploadResult 上传结果
+type UploadResult struct {
+	FileId   string
+	OrigName string // 上传时使用的原始名
+	Exist    bool   // 秒传/快传
+}
+
+// UploadFileEncrypted 上传加密文件（调用方已完成加密），返回上传结果
+func (c *Client) UploadFileEncrypted(parentFileID, name string, encReader io.Reader, encSize int64, plainHash string) (*UploadResult, error) {
 	// 读取加密数据
 	encData, err := io.ReadAll(encReader)
 	if err != nil {
-		return fmt.Errorf("read encrypted data: %w", err)
+		return nil, fmt.Errorf("read encrypted data: %w", err)
 	}
 
 	// 计算密文 hash（用于 API 的 contentHash 验证）
@@ -497,24 +504,29 @@ func (c *Client) UploadFileEncrypted(parentFileID, name string, encReader io.Rea
 
 	resp, err := c.sendRequest(BaseURL+"/file/create", createData)
 	if err != nil {
-		return fmt.Errorf("create file: %w", err)
+		return nil, fmt.Errorf("create file: %w", err)
 	}
 
 	if success, ok := resp["success"].(bool); ok && !success {
 		msg, _ := resp["message"].(string)
-		return fmt.Errorf("create failed: %s", msg)
+		return nil, fmt.Errorf("create failed: %s", msg)
 	}
+
+	result := &UploadResult{OrigName: name}
 
 	if respData, ok := resp["data"].(map[string]interface{}); ok {
 		if exist, ok := respData["exist"].(bool); ok && exist {
-			return nil
+			result.Exist = true
+			return result, nil
 		}
 		if rapidUpload, ok := respData["rapidUpload"].(bool); ok && rapidUpload {
-			return nil
+			result.Exist = true
+			return result, nil
 		}
 
 		fileId, _ := respData["fileId"].(string)
 		uploadId, _ := respData["uploadId"].(string)
+		result.FileId = fileId
 
 		if partInfos, ok := respData["partInfos"].([]interface{}); ok && len(partInfos) > 0 {
 			for _, pi := range partInfos {
@@ -533,19 +545,19 @@ func (c *Client) UploadFileEncrypted(parentFileID, name string, encReader io.Rea
 				// 上传加密数据到 COS
 				req, err := http.NewRequest("PUT", uploadUrl, bytes.NewReader(encData))
 				if err != nil {
-					return fmt.Errorf("create upload request: %w", err)
+					return nil, fmt.Errorf("create upload request: %w", err)
 				}
 				req.Header.Set("Content-Type", "application/octet-stream")
 
 				httpClient := &http.Client{Timeout: 30 * time.Minute}
 				uploadResp, err := httpClient.Do(req)
 				if err != nil {
-					return fmt.Errorf("upload part: %w", err)
+					return nil, fmt.Errorf("upload part: %w", err)
 				}
 				uploadResp.Body.Close()
 
 				if uploadResp.StatusCode >= 400 {
-					return fmt.Errorf("upload failed: status %d", uploadResp.StatusCode)
+					return nil, fmt.Errorf("upload failed: status %d", uploadResp.StatusCode)
 				}
 			}
 		}
@@ -561,12 +573,12 @@ func (c *Client) UploadFileEncrypted(parentFileID, name string, encReader io.Rea
 			}
 			_, err := c.sendRequest(BaseURL+"/file/complete", completeData)
 			if err != nil {
-				return fmt.Errorf("complete upload: %w", err)
+				return nil, fmt.Errorf("complete upload: %w", err)
 			}
 		}
 	}
 
-	return nil
+	return result, nil
 }
 
 // DownloadFile 下载文件到 writer（流式）

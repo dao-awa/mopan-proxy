@@ -259,6 +259,14 @@ tr.folder td:first-child{color:#4fc3f7;font-weight:500}
         WebDAV 地址: <code id="webdavUrl" style="background:#222;padding:2px 8px;border-radius:4px;color:#4fc3f7"></code>
       </p>
     </div>
+    <div class="settings-section">
+      <h3>&#128269; 元数据维护</h3>
+      <p style="color:#888;font-size:13px;margin-bottom:12px">
+        如果云端文件夹显示为加密名称（E_ 开头的长字符串），点击此按钮扫描云端并补建缺失的元数据映射。
+      </p>
+      <button class="btn btn-primary btn-sm" id="btnRescan">重建元数据</button>
+      <span id="rescanStatus" style="margin-left:12px;color:#888;font-size:13px"></span>
+    </div>
   </div>
 </div>
 
@@ -474,6 +482,21 @@ function updateWebdav() {
   });
 }
 
+function rescanMetadata() {
+  var status = document.getElementById('rescanStatus');
+  status.textContent = '正在扫描...';
+  status.style.color = '#4fc3f7';
+  apiPost('/api/rescan-metadata', {path: '/'}, function(d) {
+    if (d.success) {
+      status.textContent = d.data.message;
+      status.style.color = '#4caf50';
+    } else {
+      status.textContent = d.error || '扫描失败';
+      status.style.color = '#f44336';
+    }
+  });
+}
+
 function logout() {
   apiPost('/api/logout', {}, function(){ location.reload(); });
 }
@@ -540,6 +563,12 @@ document.addEventListener('click', function(e) {
   // 更新 WebDAV 按钮
   if (target.id === 'btnUpdateWebdav') {
     updateWebdav();
+    return;
+  }
+
+  // 重建元数据按钮
+  if (target.id === 'btnRescan') {
+    rescanMetadata();
     return;
   }
 

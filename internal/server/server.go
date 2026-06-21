@@ -463,6 +463,7 @@ func (s *Server) SetupRoutes() http.Handler {
 	mux.HandleFunc("/api/settings", s.authMiddleware(s.handleSettings))
 	mux.HandleFunc("/api/settings/update", s.authMiddleware(s.csrfMiddleware(s.maxBytesMiddleware(1<<20, s.handleSettingsUpdate))))
 	mux.HandleFunc("/api/stats", s.authMiddleware(s.handleStats))
+	mux.HandleFunc("/api/rescan-metadata", s.authMiddleware(s.csrfMiddleware(s.handleRescanMetadata)))
 	mux.HandleFunc("/", s.handleIndex)
 
 	// 用 authGuard 包裹所有路由
@@ -605,13 +606,29 @@ func (s *Server) resolvePath(path string) (string, error) {
 		found := false
 		for _, item := range resp.Data.Items {
 			isFolder := item.Type == "folder"
+			// 1. 精确匹配（旧版兼容）
 			if item.Name == part {
 				currentID = item.FileId
 				found = true
 				break
 			}
+			// 2. 加密名解密匹配（含时间戳后缀处理）
 			if s.enc != nil {
 				if s.origName(item.Name, isFolder) == part {
+					currentID = item.FileId
+					found = true
+					break
+				}
+			}
+			// 3. 元数据 ID 匹配
+			if s.store != nil {
+				if info, err := s.store.GetFileByID(item.FileId); err == nil && info != nil && info.OrigName == part {
+					currentID = item.FileId
+					found = true
+					break
+				}
+				// 4. 元数据名称匹配（含时间戳后缀处理）
+				if info, err := s.store.GetFileByName(item.Name, currentID); err == nil && info != nil && info.OrigName == part {
 					currentID = item.FileId
 					found = true
 					break
@@ -661,6 +678,14 @@ func (s *Server) resolvePathForUpload(path string) (string, error) {
 				currentID = item.FileId
 				found = true
 				break
+			}
+			// 元数据名称匹配
+			if s.store != nil {
+				if info, err := s.store.GetFileByID(item.FileId); err == nil && info != nil && info.OrigName == part {
+					currentID = item.FileId
+					found = true
+					break
+				}
 			}
 		}
 
@@ -769,21 +794,44 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 	var files []map[string]interface{}
 	for _, f := range resp.Data.Items {
 		isFolder := f.Type == "folder"
-		name := s.origName(f.Name, isFolder)
+		name := f.Name // 默认使用云端原始名称
 		size := f.Size
 		isEncrypted := s.enc != nil
 
+		// 名称解析回退链: 1) 按ID查元数据 → 2) 按名称+父目录查元数据 → 3) 加密解密 → 4) 原始名称
+		resolved := false
 		if s.store != nil {
-			info, err := s.store.GetFileByID(f.FileId)
-			if err == nil && info != nil {
+			// 优先级1: 按 cloud_file_id 查找
+			if info, err := s.store.GetFileByID(f.FileId); err == nil && info != nil {
 				name = info.OrigName
-				if isFolder {
-					size = 0
-				} else {
-					size = info.OrigSize
-				}
+				size = info.OrigSize
 				isEncrypted = info.IsEncrypted
+				resolved = true
 			}
+			// 优先级2: 按 cloud_name + parent 查找（处理 ID 变更或元数据不完整的情况）
+			if !resolved {
+				if info, err := s.store.GetFileByName(f.Name, parentID); err == nil && info != nil {
+					name = info.OrigName
+					size = info.OrigSize
+					isEncrypted = info.IsEncrypted
+					resolved = true
+					// 补充 ID 映射
+					info.CloudFileID = f.FileId
+					s.store.PutFile(info)
+					log.Printf("元数据回退: '%s' (id=%s) 按名称匹配到 '%s'", f.Name, f.FileId, info.OrigName)
+				}
+			}
+		}
+		// 优先级3: 加密解密（处理完全没有元数据的情况）
+		if !resolved && s.enc != nil {
+			if orig := s.origName(f.Name, isFolder); orig != f.Name {
+				name = orig
+			}
+		}
+		// 优先级4: 保持原始名称（无法解密时显示云端名称）
+
+		if isFolder {
+			size = 0
 		}
 
 		files = append(files, map[string]interface{}{
@@ -1009,6 +1057,151 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleRescanMetadata 扫描云端目录，为缺失元数据的文件/文件夹补充记录
+func (s *Server) handleRescanMetadata(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	if s.store == nil || s.enc == nil {
+		jsonError(w, "加密和元数据存储必须启用", 400)
+		return
+	}
+
+	var req struct {
+		Path string `json:"path"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	if req.Path == "" {
+		req.Path = "/"
+	}
+
+	parentID, err := s.resolvePath(req.Path)
+	if err != nil {
+		jsonError(w, "路径不存在", 404)
+		return
+	}
+
+	scanned, added, updated, err := s.rescanMetadataRecursive(parentID, "/", 0)
+	if err != nil {
+		jsonError(w, fmt.Sprintf("扫描失败: %v", err), 500)
+		return
+	}
+
+	log.Printf("元数据扫描完成: 扫描 %d 项, 新增 %d, 更新 %d", scanned, added, updated)
+	jsonOK(w, map[string]interface{}{
+		"message": fmt.Sprintf("扫描完成: 扫描 %d 项, 新增 %d 条元数据, 更新 %d 条", scanned, added, updated),
+		"scanned": scanned,
+		"added":   added,
+		"updated": updated,
+	})
+}
+
+func (s *Server) rescanMetadataRecursive(parentID, parentPath string, depth int) (scanned, added, updated int, err error) {
+	if depth > 10 {
+		return
+	}
+
+	resp, listErr := s.client.ListFiles(parentID, "")
+	if listErr != nil {
+		err = listErr
+		return
+	}
+
+	for _, item := range resp.Data.Items {
+		scanned++
+		isFolder := item.Type == "folder"
+
+		// 检查是否有元数据
+		existing, _ := s.store.GetFileByID(item.FileId)
+		if existing != nil {
+			// 已有元数据，递归处理子目录
+			if isFolder {
+				childScanned, childAdded, childUpdated, childErr := s.rescanMetadataRecursive(item.FileId, parentPath+"/"+existing.OrigName, depth+1)
+				scanned += childScanned
+				added += childAdded
+				updated += childUpdated
+				if childErr != nil {
+					err = childErr
+					return
+				}
+			}
+			continue
+		}
+
+		// 尝试解密名称
+		origName := s.origName(item.Name, isFolder)
+
+		// 如果解密失败（origName == item.Name），跳过元数据记录
+		// 避免将加密名存储为 origName，导致后续显示错误
+		if origName == item.Name && crypto.IsEncName(item.Name) {
+			if isFolder {
+				childScanned, childAdded, childUpdated, childErr := s.rescanMetadataRecursive(item.FileId, parentPath+"/"+item.Name, depth+1)
+				scanned += childScanned
+				added += childAdded
+				updated += childUpdated
+				if childErr != nil {
+					err = childErr
+					return
+				}
+			}
+			continue
+		}
+
+		itemPath := parentPath + "/" + origName
+
+		// 尝试按名称+父目录查找已有记录（处理 ID 变更）
+		existingByName, _ := s.store.GetFileByName(item.Name, parentID)
+		if existingByName != nil {
+			// 已有记录但 ID 不匹配，更新 ID
+			existingByName.CloudFileID = item.FileId
+			s.store.PutFile(existingByName)
+			updated++
+			log.Printf("元数据更新: '%s' ID %s → %s", item.Name, existingByName.CloudFileID, item.FileId)
+			if isFolder {
+				childScanned, childAdded, childUpdated, childErr := s.rescanMetadataRecursive(item.FileId, parentPath+"/"+existingByName.OrigName, depth+1)
+				scanned += childScanned
+				added += childAdded
+				updated += childUpdated
+				if childErr != nil {
+					err = childErr
+					return
+				}
+			}
+			continue
+		}
+
+		// 没有元数据，创建新记录
+		newInfo := &metadata.FileInfo{
+			CloudFileID:   item.FileId,
+			ParentCloudID: parentID,
+			CloudName:     item.Name,
+			OrigName:      origName,
+			OrigPath:      itemPath,
+			Type:          item.Type,
+			OrigSize:      item.Size,
+			IsEncrypted:   true,
+			CreatedAt:     time.Now(),
+			UpdatedAt:     time.Now(),
+		}
+		s.store.PutFile(newInfo)
+		added++
+		log.Printf("元数据补建: '%s' → '%s' (id=%s, type=%s)", item.Name, origName, item.FileId, item.Type)
+
+		if isFolder {
+			childScanned, childAdded, childUpdated, childErr := s.rescanMetadataRecursive(item.FileId, itemPath, depth+1)
+			scanned += childScanned
+			added += childAdded
+			updated += childUpdated
+			if childErr != nil {
+				err = childErr
+				return
+			}
+		}
+	}
+	return
+}
+
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -1087,7 +1280,8 @@ func (s *Server) uploadEncrypted(w http.ResponseWriter, parentID, filename strin
 
 	encName := s.encFileName(filename)
 
-	if err := s.client.UploadFileEncrypted(parentID, encName, bytes.NewReader(encrypted), int64(len(encrypted)), plainHash); err != nil {
+	uploadResult, err := s.client.UploadFileEncrypted(parentID, encName, bytes.NewReader(encrypted), int64(len(encrypted)), plainHash)
+	if err != nil {
 		jsonError(w, "上传失败", 500)
 		return
 	}
@@ -1099,11 +1293,21 @@ func (s *Server) uploadEncrypted(w http.ResponseWriter, parentID, filename strin
 	}
 
 	if s.store != nil {
-		if itemID, ok := s.findItemByName(parentID, encName, 10); ok {
+		actualFileId := uploadResult.FileId
+		actualCloudName := encName
+
+		// 秒传/快传时 fileId 为空，需要查找
+		if actualFileId == "" {
+			if itemID, ok := s.findItemByName(parentID, encName, 10); ok {
+				actualFileId = itemID
+			}
+		}
+
+		if actualFileId != "" {
 			s.store.PutFile(&metadata.FileInfo{
-				CloudFileID:   itemID,
+				CloudFileID:   actualFileId,
 				ParentCloudID: parentID,
-				CloudName:     encName,
+				CloudName:     actualCloudName,
 				OrigName:      filename,
 				Type:          "file",
 				OrigSize:      size,
